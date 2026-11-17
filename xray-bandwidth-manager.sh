@@ -66,10 +66,7 @@ apply_rules() {
     "$MODPROBE" ifb numifbs=1
     "$IP" link show dev "$IFB" >/dev/null 2>&1 || die "IFB $IFB 不存在；请检查 ifb 模块"
     "$IP" link set dev "$IFB" up
-
-    # Server egress shaping.
     "$TC" qdisc replace dev "$IFACE" root cake bandwidth "${OUT_RATE}mbit" diffserv3 triple-isolate
-    # Server ingress shaping via IFB.
     "$TC" qdisc replace dev "$IFB" root cake bandwidth "${IN_RATE}mbit" diffserv3 triple-isolate
     "$TC" qdisc replace dev "$IFACE" clsact
     "$TC" filter del dev "$IFACE" ingress pref 49152 2>/dev/null || true
@@ -127,6 +124,7 @@ status() {
 
 stats() {
     echo "每 2 秒刷新，按 Ctrl+C 返回。"
+    trap 'echo; trap - INT; return 0' INT
     while :; do
         clear
         date
@@ -137,6 +135,7 @@ stats() {
         "$TC" -s qdisc show dev "$IFB" | head -n 35
         sleep 2
     done
+    trap - INT
 }
 
 restart_service() {
@@ -174,7 +173,7 @@ change_interface() {
 pause_shaping() {
     load_config; ENABLED=0; save_config
     systemctl restart "$SERVICE"
-    echo "已暂停整形（eth0 根队列尝试恢复为 mq）。"
+    echo "已暂停整形（$IFACE 根队列尝试恢复为 mq）。"
 }
 resume_shaping() {
     load_config; ENABLED=1; save_config
