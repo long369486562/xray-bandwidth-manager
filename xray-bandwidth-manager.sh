@@ -257,11 +257,22 @@ menu() {
 main() {
     need_root
     check_dependencies
+
+    # Allow running the downloaded script from any directory. Install a stable
+    # copy at BIN so the systemd unit can call it on future boots.
+    local invoked_path
+    invoked_path="$(readlink -f "$0")"
+    if [[ "$invoked_path" != "$BIN" ]]; then
+        install -D -o root -g root -m 0755 "$invoked_path" "$BIN"
+        exec "$BIN" "$@"
+    fi
+
     if [[ "${1:-}" == "--apply" ]]; then
         load_config
         apply_rules
         exit 0
     fi
+
     [[ -f "$CONFIG" ]] || save_config
     install_service
     menu
