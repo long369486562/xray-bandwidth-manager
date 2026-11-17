@@ -66,8 +66,15 @@ apply_rules() {
     "$MODPROBE" ifb numifbs=1
     "$IP" link show dev "$IFB" >/dev/null 2>&1 || die "IFB $IFB 不存在；请检查 ifb 模块"
     "$IP" link set dev "$IFB" up
-    "$TC" qdisc replace dev "$IFACE" root cake bandwidth "${OUT_RATE}mbit" diffserv3 triple-isolate
-    "$TC" qdisc replace dev "$IFB" root cake bandwidth "${IN_RATE}mbit" diffserv3 triple-isolate
+    # Delete then add instead of using "qdisc replace": for an existing CAKE
+    # instance, replace/change updates the configured rate but can retain
+    # avg_peak_bandwidth from the old rate. Recreating CAKE resets that state.
+    # This briefly removes the root qdisc and resets its statistics.
+    "$TC" qdisc del dev "$IFACE" root 2>/dev/null || true
+    "$TC" qdisc add dev "$IFACE" root cake bandwidth "${OUT_RATE}mbit" diffserv3 triple-isolate
+
+    "$TC" qdisc del dev "$IFB" root 2>/dev/null || true
+    "$TC" qdisc add dev "$IFB" root cake bandwidth "${IN_RATE}mbit" diffserv3 triple-isolate
     "$TC" qdisc replace dev "$IFACE" clsact
     "$TC" filter del dev "$IFACE" ingress pref 49152 2>/dev/null || true
     "$TC" filter add dev "$IFACE" ingress protocol all pref 49152 \
