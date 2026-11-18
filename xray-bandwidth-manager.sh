@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Xray Bandwidth Manager - Debian 11+, systemd, iproute2, CAKE and IFB.
 APP="xray-bandwidth-manager"
-VERSION="1.0.0"
+VERSION="1.1.0"
 BIN="/usr/local/sbin/xray-bandwidth-manager"
 CONFIG="/etc/default/xray-bandwidth-manager"
 SERVICE="xray-bandwidth-shaping"
