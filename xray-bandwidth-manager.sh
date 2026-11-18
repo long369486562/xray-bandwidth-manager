@@ -17,6 +17,10 @@ IFB="ifb0"
 OUT_RATE="24"
 IN_RATE="24"
 ENABLED="1"
+BBR_ENABLED="0"
+BBR_SYSCTL="/etc/sysctl.d/99-xray-bandwidth-manager-bbr.conf"
+BBR_STATE_DIR="/var/lib/xray-bandwidth-manager"
+BBR_STATE_FILE="${BBR_STATE_DIR}/previous-congestion-control"
 
 die() { echo "错误：$*" >&2; exit 1; }
 need_root() { [[ $EUID -eq 0 ]] || die "请使用 root 运行：$BIN"; }
@@ -42,6 +46,7 @@ IFB='$IFB'
 OUT_RATE='$OUT_RATE'
 IN_RATE='$IN_RATE'
 ENABLED='$ENABLED'
+BBR_ENABLED='$BBR_ENABLED'
 EOF
     install -o root -g root -m 600 "$tmp" "$CONFIG"
     rm -f "$tmp"
@@ -53,6 +58,7 @@ check_dependencies() {
     [[ -x "$MODPROBE" ]] || die "找不到 modprobe，请安装 kmod"
     command -v systemctl >/dev/null || die "此工具需要 systemd"
     command -v awk >/dev/null || die "缺少 awk"
+    command -v sysctl >/dev/null || die "缺少 sysctl"
 }
 
 apply_rules() {
@@ -89,6 +95,119 @@ remove_shaping() {
     "$TC" qdisc del dev "$IFB" root 2>/dev/null || true
 }
 
+
+current_cc() {
+    sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown
+}
+
+available_cc() {
+    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true
+}
+
+bbr_supported() {
+    local available
+    available="$(available_cc)"
+    [[ " $available " == *" bbr "* ]]
+}
+
+bbr_diagnostics() {
+    local kernel cc available cake_out cake_in
+    kernel="$(uname -r)"
+    cc="$(current_cc)"
+    available="$(available_cc)"
+    cake_out="$("$TC" qdisc show dev "$IFACE" 2>/dev/null | grep -m1 'qdisc cake' || true)"
+    cake_in="$("$TC" qdisc show dev "$IFB" 2>/dev/null | grep -m1 'qdisc cake' || true)"
+
+    echo "内核版本：$kernel"
+    echo "当前 TCP 拥塞控制：$cc"
+    echo "内核可用算法：${available:-无法读取}"
+    if bbr_supported; then
+        echo "BBR 支持：是"
+    else
+        echo "BBR 支持：否（当前内核未在可用算法列表中提供 bbr）"
+    fi
+    if [[ "$cc" == "bbr" ]]; then
+        echo "BBR 状态：已运行"
+    else
+        echo "BBR 状态：未运行"
+    fi
+    [[ -n "$cake_out" ]] && echo "出站 CAKE：已检测到" || echo "出站 CAKE：未检测到"
+    [[ -n "$cake_in" ]] && echo "入站 CAKE：已检测到" || echo "入站 CAKE：未检测到"
+    if [[ "$(printf '%s\n' "$kernel" | cut -d. -f1-2 | awk -F. '{print ($1*100+$2)}')" -ge 420 ]]; then
+        echo "TCP 内部 pacing：内核版本支持（Linux 4.20+）"
+    else
+        echo "TCP 内部 pacing：旧内核；建议确认 sch_fq 可用"
+    fi
+    echo "说明：default_qdisc 不会覆盖已经显式配置的 CAKE 根队列。"
+}
+
+enable_bbr() {
+    local previous
+    if ! bbr_supported; then
+        "$MODPROBE" tcp_bbr 2>/dev/null || true
+    fi
+    bbr_supported || die "当前内核不支持 BBR；请检查 tcp_bbr 模块或更换内核"
+
+    install -d -m 700 "$BBR_STATE_DIR"
+    if [[ ! -f "$BBR_STATE_FILE" ]]; then
+        previous="$(current_cc)"
+        printf '%s\n' "$previous" >"$BBR_STATE_FILE"
+        chmod 600 "$BBR_STATE_FILE"
+    fi
+
+    install -d -m 755 /etc/sysctl.d
+    cat >"$BBR_SYSCTL" <<'EOF_BBR'
+# Managed by xray-bandwidth-manager. Enables TCP BBR.
+net.ipv4.tcp_congestion_control = bbr
+EOF_BBR
+    chmod 644 "$BBR_SYSCTL"
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
+    BBR_ENABLED=1
+    save_config
+    echo "BBR 已启用，并已写入 $BBR_SYSCTL"
+}
+
+disable_bbr() {
+    local previous available
+    previous="cubic"
+    if [[ -f "$BBR_STATE_FILE" ]]; then
+        IFS= read -r previous <"$BBR_STATE_FILE" || true
+    fi
+    available="$(available_cc)"
+    if [[ " $available " != *" $previous "* ]]; then
+        previous="cubic"
+    fi
+    if [[ " $available " != *" $previous "* ]]; then
+        previous="$(awk '{print $1}' <<<"$available")"
+    fi
+    [[ -n "$previous" ]] || die "无法确定可恢复的 TCP 拥塞控制算法"
+    sysctl -w "net.ipv4.tcp_congestion_control=$previous" >/dev/null
+    rm -f "$BBR_SYSCTL" "$BBR_STATE_FILE"
+    BBR_ENABLED=0
+    save_config
+    echo "已关闭本工具管理的 BBR，当前 TCP 拥塞控制恢复为：$previous"
+}
+
+bbr_menu() {
+    while :; do
+        echo
+        echo "========== BBR + CAKE 管理 =========="
+        bbr_diagnostics
+        echo "-------------------------------------"
+        echo "1. 启用 BBR（持久化）"
+        echo "2. 关闭 BBR 并恢复此前算法"
+        echo "0. 返回主菜单"
+        local choice
+        read -rp "请选择操作：" choice
+        case "$choice" in
+            1) enable_bbr ;;
+            2) disable_bbr ;;
+            0) return 0 ;;
+            *) echo "无效选项" ;;
+        esac
+    done
+}
+
 install_service() {
     cat >"$SERVICE_FILE" <<EOF
 [Unit]
@@ -116,8 +235,13 @@ status() {
     echo "服务器出站限速：${OUT_RATE} Mbps"
     echo "服务器入站限速：${IN_RATE} Mbps"
     echo "配置开关：$([[ "$ENABLED" == 1 ]] && echo 启用 || echo 暂停)"
+    echo "BBR：$(current_cc)（管理状态：$([[ "$BBR_ENABLED" == 1 ]] && echo 已启用 || echo 未由本工具管理)）"
+    echo "默认 qdisc：$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)（仅供参考；eth0/ifb0 使用 CAKE）"
     echo "开机启动：$(systemctl is-enabled "$SERVICE" 2>/dev/null || echo 未启用)"
     echo "服务状态：$(systemctl is-active "$SERVICE" 2>/dev/null || echo 未运行)"
+    echo
+    echo "=== BBR + CAKE 诊断 ==="
+    bbr_diagnostics
     echo
     echo "=== 出站 qdisc：$IFACE ==="
     "$TC" -s qdisc show dev "$IFACE" || true
@@ -237,6 +361,7 @@ menu() {
         echo "7. 设置开机启动"
         echo "8. 修改物理网卡"
         echo "9. 重启整形服务"
+        echo "10. BBR 管理与诊断"
         echo "U. 卸载管理工具"
         echo "0. 退出"
         echo
@@ -252,6 +377,7 @@ menu() {
             7) boot_menu ;;
             8) change_interface ;;
             9) systemctl restart "$SERVICE"; echo "服务已重启" ;;
+            10) bbr_menu ;;
             U|u) uninstall_tool ;;
             0) exit 0 ;;
             *) echo "无效选项" ;;
