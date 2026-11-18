@@ -14,6 +14,9 @@
 - 通过 IFB 将入站流量重定向后整形
 - 交互式菜单查看 qdisc 状态和统计
 - 支持暂停、恢复、修改网卡和开机自动应用
+- 检测 BBR、CAKE、当前 TCP 拥塞控制算法及默认 qdisc
+- 持久化启用/关闭 BBR，并记录和恢复启用前的拥塞控制算法
+- 检查 BBR + CAKE 组合状态；不擅自将 CAKE 根队列替换为 FQ
 - 使用 systemd oneshot 服务在网络启动后应用规则
 
 ## 系统要求
@@ -70,6 +73,7 @@ chmod 0755 /usr/local/sbin/xray-bandwidth-manager
 | 7 | 启用或禁用开机自动启动 |
 | 8 | 修改物理网卡 |
 | 9 | 重启整形服务 |
+| 10 | BBR 管理与诊断（检测、启用、关闭、恢复此前算法） |
 | U | 卸载管理工具 |
 | 0 | 退出 |
 
@@ -80,6 +84,22 @@ systemctl status xray-bandwidth-shaping
 systemctl restart xray-bandwidth-shaping
 journalctl -u xray-bandwidth-shaping -b
 ```
+
+## BBR + CAKE 协同管理
+
+菜单 10 提供 BBR 检测与管理：
+
+- 检测内核可用 TCP 拥塞控制算法、当前算法和内核版本
+- 检测物理网卡与 IFB 上是否存在 CAKE
+- 持久化启用 net.ipv4.tcp_congestion_control=bbr
+- 关闭时恢复首次启用前记录的拥塞控制算法
+- BBR 配置写入 /etc/sysctl.d/99-xray-bandwidth-manager-bbr.conf
+
+**重要：BBR 与 CAKE 负责不同层面。** BBR 是 TCP 拥塞控制算法；CAKE 是 qdisc，负责整形、队列管理和流/主机公平。Linux 4.20 及更新内核支持 TCP 层内部 pacing，因此在当前 CAKE 根队列下不需要为了 BBR 强行把物理网卡根 qdisc 改为 FQ。net.core.default_qdisc 只影响后续创建的默认队列，不会替换本工具显式配置的 CAKE。
+
+本工具不会修改 net.core.default_qdisc，也不会把 eth0 或 ifb0 的 CAKE 替换为 FQ。BBR 只作用于 TCP；UDP 流量仍由 CAKE 等队列规则处理。
+
+关闭 BBR 时，工具会尝试恢复首次通过本菜单启用 BBR 前保存的 TCP 拥塞控制算法。如果之前的算法已不可用，则回退到 cubic；如果 cubic 也不可用，则选择内核可用算法列表中的第一个算法。
 
 ## 配置文件
 
