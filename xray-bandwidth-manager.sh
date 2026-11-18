@@ -210,7 +210,7 @@ bbr_menu() {
 }
 
 bbr_monitor() {
-    local port="\${1:-}"
+    local port="${1:-}"
     local iface="$IFACE"
     local rx_prev tx_prev rx_now tx_now rx_rate tx_rate
     local key snapshot
@@ -229,7 +229,7 @@ bbr_monitor() {
     while :; do
         clear 2>/dev/null || true
         echo "========== BBR 实时带宽监控 =========="
-        printf '网卡：%s    本地端口过滤：%s    刷新：2 秒\n' "$iface" "\${port:-全部}"
+        printf '网卡：%s    本地端口过滤：%s    刷新：2 秒\n' "$iface" "${port:-全部}"
         echo "退出：按 q"
         echo "--------------------------------------"
 
