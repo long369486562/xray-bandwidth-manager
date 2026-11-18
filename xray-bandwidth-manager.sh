@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Xray Bandwidth Manager - Debian 11+, systemd, iproute2, CAKE and IFB.
 APP="xray-bandwidth-manager"
-VERSION="1.1.0"
+VERSION="1.2.0"
 BIN="/usr/local/sbin/xray-bandwidth-manager"
 CONFIG="/etc/default/xray-bandwidth-manager"
 SERVICE="xray-bandwidth-shaping"
@@ -58,6 +58,7 @@ check_dependencies() {
     [[ -x "$MODPROBE" ]] || die "找不到 modprobe，请安装 kmod"
     command -v systemctl >/dev/null || die "此工具需要 systemd"
     command -v awk >/dev/null || die "缺少 awk"
+    command -v ss >/dev/null || die "缺少 ss（请安装 iproute2）"
     command -v sysctl >/dev/null || die "缺少 sysctl"
 }
 
@@ -202,6 +203,126 @@ bbr_menu() {
         case "$choice" in
             1) enable_bbr ;;
             2) disable_bbr ;;
+            0) return 0 ;;
+            *) echo "无效选项" ;;
+        esac
+    done
+}
+
+bbr_monitor() {
+    local port="\${1:-}"
+    local iface="$IFACE"
+    local rx_prev tx_prev rx_now tx_now rx_rate tx_rate
+    local key snapshot
+
+    if [[ -n "$port" && ! "$port" =~ ^[0-9]{1,5}$ ]] || [[ -n "$port" && "$port" -gt 65535 ]]; then
+        echo "端口必须是 1-65535 的数字"
+        return 1
+    fi
+    [[ -r "/sys/class/net/$iface/statistics/rx_bytes" ]] || {
+        echo "无法读取网卡 $iface 的统计信息"
+        return 1
+    }
+
+    rx_prev="$(cat "/sys/class/net/$iface/statistics/rx_bytes")"
+    tx_prev="$(cat "/sys/class/net/$iface/statistics/tx_bytes")"
+    while :; do
+        clear 2>/dev/null || true
+        echo "========== BBR 实时带宽监控 =========="
+        printf '网卡：%s    本地端口过滤：%s    刷新：2 秒\n' "$iface" "\${port:-全部}"
+        echo "退出：按 q"
+        echo "--------------------------------------"
+
+        if [[ -n "$port" ]]; then
+            snapshot="$(ss -Htin state established "( sport = :$port )" 2>/dev/null || true)"
+        else
+            snapshot="$(ss -Htin state established 2>/dev/null || true)"
+        fi
+
+        printf '%s\n' "$snapshot" | awk '
+        function rate(v, n, unit) {
+            if (v == "" || v == "-") return "-"
+            unit=v
+            sub(/^[0-9.]+/, "", unit)
+            n=v
+            sub(/[KMG]?bps$/, "", n)
+            if (unit == "Kbps") n*=1000
+            else if (unit == "Mbps") n*=1000000
+            else if (unit == "Gbps") n*=1000000000
+            return sprintf("%.2f", n/1000000)
+        }
+        function field(pattern,    x) {
+            if (match(info, pattern)) {
+                x=substr(info, RSTART, RLENGTH)
+                sub(/^[^: ]+[: ]*/, "", x)
+                return x
+            }
+            return "-"
+        }
+        BEGIN {
+            print "本地端点                         远端端点                         bw(Mbps) pacing(Mbps) delivery(Mbps) RTT(ms) minRTT(ms) cwnd 状态"
+            print "--------------------------------------------------------------------------------------------------------------------------------"
+        }
+        /^ESTAB[[:space:]]/ {
+            local_ep=$4
+            peer_ep=$5
+            info=""
+            next
+        }
+        /bbr[[:space:]]/ {
+            info=$0
+            if (local_ep == "" || peer_ep == "") next
+            bw=field("bw:[0-9.]+[KMG]?bps")
+            pacing=field("pacing_rate[[:space:]]+[0-9.]+[KMG]?bps")
+            delivery=field("delivery_rate[[:space:]]+[0-9.]+[KMG]?bps")
+            rtt=field("rtt:[0-9.]+")
+            minrtt=field("minrtt:[0-9.]+")
+            cwnd=field("cwnd:[0-9]+")
+            state=(info ~ /app_limited/ ? "app-limited" : "正常")
+            printf "%-32s %-32s %9s %13s %15s %8s %10s %4s %s\n", local_ep,peer_ep,rate(bw),rate(pacing),rate(delivery),rtt,minrtt,cwnd,state
+            count++
+            sum_bw+=rate(bw)*1000000
+            sum_delivery+=rate(delivery)*1000000
+            if (state == "app-limited") limited++
+            local_ep=""; peer_ep=""; info=""
+        }
+        END {
+            if (count == 0) print "没有找到符合条件的 BBR TCP 连接。"
+            printf "\nBBR 连接：%d    app-limited：%d    各连接 bw 估计值之和：%.2f Mbps    delivery_rate 之和：%.2f Mbps\n", count,limited,sum_bw/1000000,sum_delivery/1000000
+        }'
+
+        rx_now="$(cat "/sys/class/net/$iface/statistics/rx_bytes")"
+        tx_now="$(cat "/sys/class/net/$iface/statistics/tx_bytes")"
+        rx_rate=$(( (rx_now - rx_prev) * 8 / 2 ))
+        tx_rate=$(( (tx_now - tx_prev) * 8 / 2 ))
+        printf '网卡 %s 实际速率（2 秒采样）：接收 %s Mbps    发送 %s Mbps\n' "$iface" \
+            "$(awk -v n="$rx_rate" 'BEGIN {printf "%.2f",n/1000000}')" \
+            "$(awk -v n="$tx_rate" 'BEGIN {printf "%.2f",n/1000000}')"
+        echo "提示：连接 bw 是每条 TCP 连接的 BBR 估计；汇总值不是物理链路容量。app-limited 表示应用发送量不足。"
+
+        rx_prev="$rx_now"
+        tx_prev="$tx_now"
+        key=""
+        read -r -t 2 -n 1 key || true
+        [[ "$key" == "q" || "$key" == "Q" ]] && break
+    done
+}
+
+bbr_monitor_menu() {
+    local choice port
+    while :; do
+        echo
+        echo "========== BBR 实时带宽监控 =========="
+        echo "1. 监控全部 BBR TCP 连接"
+        echo "2. 按本地端口监控（例如 Xray 入站端口 10040）"
+        echo "0. 返回主菜单"
+        read -rp "请选择操作：" choice
+        case "$choice" in
+            1) bbr_monitor ;;
+            2)
+                read -rp "输入本地监听端口：" port
+                bbr_monitor "$port"
+                ;;
             0) return 0 ;;
             *) echo "无效选项" ;;
         esac
@@ -362,6 +483,7 @@ menu() {
         echo "8. 修改物理网卡"
         echo "9. 重启整形服务"
         echo "10. BBR 管理与诊断"
+        echo "11. BBR 实时带宽监控"
         echo "U. 卸载管理工具"
         echo "0. 退出"
         echo
@@ -378,6 +500,7 @@ menu() {
             8) change_interface ;;
             9) systemctl restart "$SERVICE"; echo "服务已重启" ;;
             10) bbr_menu ;;
+            11) bbr_monitor_menu ;;
             U|u) uninstall_tool ;;
             0) exit 0 ;;
             *) echo "无效选项" ;;
